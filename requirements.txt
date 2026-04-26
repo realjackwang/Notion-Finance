@@ -1,6 +1,6 @@
-notion-client==2.2.1
-requests==2.31.0
-sm-crypto==0.3.3
-python-dotenv==1.0.0
-chinesecalendar>=1.9.2
+notion-client==3.0.0
+requests==2.33.0
+sm-crypto==0.1.1
+python-dotenv==1.2.2
+chinesecalendar
 holidays
