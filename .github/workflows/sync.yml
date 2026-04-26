@@ -49,7 +49,7 @@ jobs:
         run: python main.py
 
   workflow-keepalive:
-    if: github.event_name == ''
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
       actions: write
