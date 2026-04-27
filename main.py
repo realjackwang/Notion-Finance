@@ -998,8 +998,22 @@ def update_notion():
     )
 
 if __name__ == "__main__":
-    # 1. 率先侦测市场，写入定投流水
-    auto_record_investments()
-    
-    # 2. 拉取净值、计算最新成本并生成当日全局快照
-    update_notion()
+    # 运行模式：
+    # morning -> 仅写入定投待确认日志
+    # evening -> 处理待确认定投 + 净值/成本/快照全流程
+    # all     -> morning + evening（本地手动联调）
+    run_mode = (os.environ.get("RUN_MODE") or "all").strip().lower()
+
+    log_section(f"任务启动 | 模式: {run_mode}")
+
+    if run_mode == "morning":
+        auto_record_investments()
+    elif run_mode == "evening":
+        update_notion()
+    elif run_mode == "all":
+        auto_record_investments()
+        update_notion()
+    else:
+        log_warn(f"未知 RUN_MODE={run_mode}，按 all 执行")
+        auto_record_investments()
+        update_notion()

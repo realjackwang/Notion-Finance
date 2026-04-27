@@ -2,14 +2,68 @@ name: Notion Finance Auto Sync
 
 on:
   schedule:
+    # 每天北京时间 08:00 执行 (UTC 时间 00:00)
+    - cron: '0 0 * * *'
     # 每天北京时间 22:00 执行 (UTC 时间 14:00)
     - cron: '0 14 * * *'
   
   # 允许在 GitHub 网页端手动点击按钮运行
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: '运行模式: morning(仅写定投待确认) / evening(处理待确认+更新净值成本快照) / all(完整流程)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - morning
+          - evening
+          - all
 
 jobs:
-  sync_and_calculate:
+  morning_enqueue:
+    if: >
+      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_mode == 'morning')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 安装依赖包
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 运行早间定投入队
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DATABASE_ID_ASSETS: ${{ secrets.DATABASE_ID_ASSETS }}
+          DATABASE_ID_TRANSACTIONS: ${{ secrets.DATABASE_ID_TRANSACTIONS }}
+          DATABASE_ID_HISTORY: ${{ secrets.DATABASE_ID_HISTORY }}
+          DATABASE_ID_DCA_LOGS: ${{ secrets.DATABASE_ID_DCA_LOGS }}
+
+          NOTION_BLOCK_TOTAL_ASSET_ID: ${{ secrets.NOTION_BLOCK_TOTAL_ASSET_ID }}
+          NOTION_BLOCK_CUMULATIVE_PROFIT_ID: ${{ secrets.NOTION_BLOCK_CUMULATIVE_PROFIT_ID }}
+          NOTION_BLOCK_DAILY_PROFIT_ID: ${{ secrets.NOTION_BLOCK_DAILY_PROFIT_ID }}
+          NOTION_BLOCK_MAX_DRAWDOWN_ID: ${{ secrets.NOTION_BLOCK_MAX_DRAWDOWN_ID }}
+          NOTION_BLOCK_ANNUAL_RETURN_ID: ${{ secrets.NOTION_BLOCK_ANNUAL_RETURN_ID }}
+
+          CMB_AUTH_KEY: ${{ secrets.CMB_AUTH_KEY }}
+          RUN_MODE: morning
+        run: python main.py
+
+  evening_finalize:
+    if: >
+      (github.event_name == 'schedule' && github.event.schedule == '0 14 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_mode == 'evening')
     runs-on: ubuntu-latest
     
     steps:
@@ -27,31 +81,58 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           
-      - name: 运行同步脚本
+      - name: 运行晚间结算流程
         env:
-          # 核心数据库配置
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DATABASE_ID_ASSETS: ${{ secrets.DATABASE_ID_ASSETS }}
           DATABASE_ID_TRANSACTIONS: ${{ secrets.DATABASE_ID_TRANSACTIONS }}
           DATABASE_ID_HISTORY: ${{ secrets.DATABASE_ID_HISTORY }}
           DATABASE_ID_DCA_LOGS: ${{ secrets.DATABASE_ID_DCA_LOGS }}
           
-          # 仪表盘块 ID 配置
           NOTION_BLOCK_TOTAL_ASSET_ID: ${{ secrets.NOTION_BLOCK_TOTAL_ASSET_ID }}
           NOTION_BLOCK_CUMULATIVE_PROFIT_ID: ${{ secrets.NOTION_BLOCK_CUMULATIVE_PROFIT_ID }}
           NOTION_BLOCK_DAILY_PROFIT_ID: ${{ secrets.NOTION_BLOCK_DAILY_PROFIT_ID }}
           NOTION_BLOCK_MAX_DRAWDOWN_ID: ${{ secrets.NOTION_BLOCK_MAX_DRAWDOWN_ID }}
           NOTION_BLOCK_ANNUAL_RETURN_ID: ${{ secrets.NOTION_BLOCK_ANNUAL_RETURN_ID }}
           
-          # 招商银行鉴权配置
           CMB_AUTH_KEY: ${{ secrets.CMB_AUTH_KEY }}
+          RUN_MODE: evening
           
         run: python main.py
 
-  workflow-keepalive:
-    if: github.event_name == 'schedule'
+  manual_full:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mode == 'all'
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
+
     steps:
-      - uses: liskin/gh-workflow-keepalive@v1
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 安装依赖包
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 手动运行完整流程
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DATABASE_ID_ASSETS: ${{ secrets.DATABASE_ID_ASSETS }}
+          DATABASE_ID_TRANSACTIONS: ${{ secrets.DATABASE_ID_TRANSACTIONS }}
+          DATABASE_ID_HISTORY: ${{ secrets.DATABASE_ID_HISTORY }}
+          DATABASE_ID_DCA_LOGS: ${{ secrets.DATABASE_ID_DCA_LOGS }}
+
+          NOTION_BLOCK_TOTAL_ASSET_ID: ${{ secrets.NOTION_BLOCK_TOTAL_ASSET_ID }}
+          NOTION_BLOCK_CUMULATIVE_PROFIT_ID: ${{ secrets.NOTION_BLOCK_CUMULATIVE_PROFIT_ID }}
+          NOTION_BLOCK_DAILY_PROFIT_ID: ${{ secrets.NOTION_BLOCK_DAILY_PROFIT_ID }}
+          NOTION_BLOCK_MAX_DRAWDOWN_ID: ${{ secrets.NOTION_BLOCK_MAX_DRAWDOWN_ID }}
+          NOTION_BLOCK_ANNUAL_RETURN_ID: ${{ secrets.NOTION_BLOCK_ANNUAL_RETURN_ID }}
+
+          CMB_AUTH_KEY: ${{ secrets.CMB_AUTH_KEY }}
+          RUN_MODE: all
+        run: python main.py
