@@ -616,7 +616,8 @@ def process_pending_auto_invest_logs(asset_pages):
                     "所属资产": {"relation": [{"id": asset_page_id}]},
                     "交易类型": {"select": {"name": "买入"}},
                     "发生金额": {"number": amount},
-                    "成交份额": {"number": confirmed_shares}
+                    "成交份额": {"number": confirmed_shares},
+                    "定投": {"checkbox": True}
                 }
             )
             notion.pages.update(
