@@ -1,12 +1,6 @@
 name: Notion Finance Auto Sync
 
 on:
-  schedule:
-    # 每天北京时间 08:00 执行 (UTC 时间 00:00)
-    - cron: '0 0 * * *'
-    # 每天北京时间 22:00 执行 (UTC 时间 14:00)
-    - cron: '0 14 * * *'
-  
   # 允许在 GitHub 网页端手动点击按钮运行
   workflow_dispatch:
     inputs:
@@ -22,9 +16,7 @@ on:
 
 jobs:
   morning_enqueue:
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * *') ||
-      (github.event_name == 'workflow_dispatch' && inputs.run_mode == 'morning')
+    if: inputs.run_mode == 'morning'
     runs-on: ubuntu-latest
 
     steps:
@@ -61,9 +53,7 @@ jobs:
         run: python main.py
 
   evening_finalize:
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 14 * * *') ||
-      (github.event_name == 'workflow_dispatch' && inputs.run_mode == 'evening')
+    if: inputs.run_mode == 'evening'
     runs-on: ubuntu-latest
     
     steps:
@@ -101,7 +91,7 @@ jobs:
         run: python main.py
 
   manual_full:
-    if: github.event_name == 'workflow_dispatch' && inputs.run_mode == 'all'
+    if: inputs.run_mode == 'all'
     runs-on: ubuntu-latest
 
     steps:

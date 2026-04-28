@@ -226,13 +226,21 @@ def is_market_trading_day(day, market, holiday_calendars):
 
 def http_request(method, url, **kwargs):
     try:
-        return requests.request(method, url, **kwargs)
-    except requests.exceptions.ProxyError as e:
-        log_warn(f"检测到代理错误，改为直连重试: {e}")
         return DIRECT_REQUEST_SESSION.request(method, url, **kwargs)
-    except requests.exceptions.SSLError as e:
-        log_warn(f"检测到 SSL 错误，改为直连重试: {e}")
-        return DIRECT_REQUEST_SESSION.request(method, url, **kwargs)
+    except (requests.exceptions.ProxyError, requests.exceptions.SSLError) as e:
+        log_warn(f"直连失败，回退到系统代理/默认会话: {e}")
+        try:
+            return requests.request(method, url, **kwargs)
+        except Exception as e2:
+            log_warn(f"使用系统代理/默认会话仍然失败: {e2}")
+            raise
+    except Exception as e:
+        log_warn(f"直连发生错误，尝试回退: {e}")
+        try:
+            return requests.request(method, url, **kwargs)
+        except Exception as e2:
+            log_warn(f"回退失败: {e2}")
+            raise
 
 def generate_cmb_signature(timespan):
     try:
@@ -739,6 +747,54 @@ def get_yesterday_profit(today=None):
         return 0.0
 
 
+def get_yesterday_profit_delta(today=None):
+    """返回昨日的当日盈亏（昨日累计盈亏 - 前一日累计盈亏）。"""
+    if not HISTORY_DB_ID:
+        return 0.0
+    today = today or datetime.date.today()
+    try:
+        db_info = notion.databases.retrieve(database_id=HISTORY_DB_ID)
+        ds_id = db_info.get("data_sources", [{}])[0].get("id")
+
+        results = query_all_data_source_rows(ds_id)
+        if not results:
+            return 0.0
+
+        def get_history_date(page):
+            return page.get("properties", {}).get("日期", {}).get("date", {}).get("start", "1970-01-01")
+
+        history_before_today = [
+            page for page in results
+            if get_history_date(page) < today.strftime("%Y-%m-%d")
+        ]
+
+        if not history_before_today:
+            return 0.0
+
+        history_before_today.sort(key=get_history_date, reverse=True)
+        yesterday_props = history_before_today[0].get("properties", {})
+        yesterday_profit = yesterday_props.get("累计总盈亏", {}).get("number")
+        if yesterday_profit is None:
+            last_val = yesterday_props.get("总市值", {}).get("number") or 0.0
+            last_cost = yesterday_props.get("总本金", {}).get("number") or 0.0
+            yesterday_profit = last_val - last_cost
+
+        if len(history_before_today) > 1:
+            before_props = history_before_today[1].get("properties", {})
+            before_profit = before_props.get("累计总盈亏", {}).get("number")
+            if before_profit is None:
+                b_val = before_props.get("总市值", {}).get("number") or 0.0
+                b_cost = before_props.get("总本金", {}).get("number") or 0.0
+                before_profit = b_val - b_cost
+        else:
+            before_profit = 0.0
+
+        return round((yesterday_profit or 0.0) - (before_profit or 0.0), 2)
+    except Exception as e:
+        log_warn(f"读取昨日增量快照失败: {e}")
+        return 0.0
+
+
 def upsert_history_snapshot(snapshot_date, total_val, total_cost, total_profit, daily_profit, weighted_annual_return):
     db_info = notion.databases.retrieve(database_id=HISTORY_DB_ID)
     ds_id = db_info.get("data_sources", [{}])[0].get("id")
@@ -836,7 +892,7 @@ def update_dashboard_blocks(total_val, total_profit, daily_profit, total_cost, w
     )
     update_text_block(
         DAILY_PROFIT_BLOCK_ID,
-        f"{format_currency(daily_profit, decimals=2, show_sign=True)} 今日盈亏（{format_percent(daily_rate)}）",
+        f"{format_currency(daily_profit, decimals=2, show_sign=True)} 昨日盈亏（{format_percent(daily_rate)}）",
         get_profit_color(daily_profit),
     )
     update_text_block(
@@ -974,8 +1030,10 @@ def update_notion():
     weighted_max_drawdown_pct = round(-(weighted_max_drawdown / total_val) * 100, 2) if total_val > 0 else 0.0
 
     snapshot_date = time.strftime("%Y-%m-%d")
-    yesterday_profit = get_yesterday_profit(today=datetime.datetime.strptime(snapshot_date, "%Y-%m-%d").date())
-    daily_profit = total_profit - yesterday_profit
+    yesterday_cumulative = get_yesterday_profit(today=datetime.datetime.strptime(snapshot_date, "%Y-%m-%d").date())
+    daily_profit = total_profit - yesterday_cumulative
+    # 仪表盘中需要显示的是“昨日盈亏”（即昨天的增量），而不是今日的变动。
+    yesterday_delta = get_yesterday_profit_delta(today=datetime.datetime.strptime(snapshot_date, "%Y-%m-%d").date())
 
     upsert_history_snapshot(
         snapshot_date=snapshot_date,
@@ -988,7 +1046,8 @@ def update_notion():
     update_dashboard_blocks(
         total_val,
         total_profit,
-        daily_profit,
+        # 这里把传入的当日值替换为昨日增量，以便仪表盘显示“昨日盈亏”。
+        yesterday_delta,
         total_cost,
         weighted_max_drawdown_pct,
         weighted_annual_return,
