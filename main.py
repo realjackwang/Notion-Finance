@@ -299,7 +299,7 @@ def get_fund_info(fund_code):
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
     }
 
-    result = {"price": None, "drawdown": None, "nav_date": None}
+    result = {"price": None, "drawdown": None, "daily_change": None, "nav_date": None}
 
     try:
         response = http_request("GET", url, headers=headers, timeout=10)
@@ -317,6 +317,11 @@ def get_fund_info(fund_code):
                 val = item.get("data_value_number")
                 if val is not None and val != "":
                     result["drawdown"] = float(val)
+            elif item.get("data_name") == "日涨跌":
+                val = item.get("data_value_number")
+                if val is not None and val != "":
+                    # Notion 百分比字段会自动按百分比显示，因此这里存小数
+                    result["daily_change"] = float(val) / 100
     except Exception as e:
         log_warn(f"主接口(雪球基金)请求 {fund_code} 出错: {e}")
 
@@ -328,6 +333,33 @@ def get_fund_info(fund_code):
         result["nav_date"] = tiantian_snapshot.get("nav_date")
 
     return result
+
+
+def get_cmb_wealth_daily_change(product_code, saa_code, current_price, nav_date=None, lookback_days=7):
+    if not current_price or not saa_code:
+        return None
+
+    base_date = None
+    if nav_date:
+        try:
+            base_date = datetime.datetime.strptime(nav_date, "%Y-%m-%d").date()
+        except ValueError:
+            base_date = None
+    if base_date is None:
+        base_date = datetime.date.today()
+
+    for offset in range(1, lookback_days + 1):
+        candidate_date = base_date - datetime.timedelta(days=offset)
+        history_info = get_cmb_wealth_price_by_date(
+            product_code,
+            saa_code,
+            candidate_date.strftime("%Y-%m-%d")
+        )
+        previous_price = history_info.get("price")
+        if previous_price not in (None, 0):
+            return round((current_price - previous_price) / previous_price, 6)
+
+    return None
 
 
 def get_fund_price_by_date(fund_code, trade_date):
@@ -919,6 +951,7 @@ def update_notion():
         last_nav_update_date = get_property_date(page, "净值日期")
         current_nav_value = get_number_value(page, "当前净值")
         current_drawdown_value = get_number_value(page, "最大回撤")
+        current_daily_change_value = get_number_value(page, "日涨跌")
 
         try:
             code_prop = props.get("产品代码", {}).get("rich_text", [])
@@ -936,13 +969,15 @@ def update_notion():
                     fund_info = get_fund_info(fund_code)
                     price = fund_info.get("price")
                     drawdown = fund_info.get("drawdown")
+                    daily_change = fund_info.get("daily_change")
                     nav_date = fund_info.get("nav_date")
                     no_price_change = numbers_equal(price, current_nav_value)
                     no_drawdown_change = drawdown is None or numbers_equal(drawdown, current_drawdown_value)
+                    no_daily_change = daily_change is None or numbers_equal(daily_change, current_daily_change_value)
                     same_nav_date = nav_date == last_nav_update_date
 
-                    if same_nav_date and no_price_change and no_drawdown_change:
-                        log_skip(f"基金 {fund_code} ({asset_name}) 净值/回撤未变化 | 净值日期: {nav_date or '无'}")
+                    if same_nav_date and no_price_change and no_drawdown_change and no_daily_change:
+                        log_skip(f"基金 {fund_code} ({asset_name}) 净值/回撤/日涨跌未变化 | 净值日期: {nav_date or '无'}")
                     else:
                         update_properties = {}
 
@@ -951,6 +986,9 @@ def update_notion():
 
                         if drawdown is not None and not no_drawdown_change:
                             update_properties["最大回撤"] = {"number": drawdown}
+
+                        if daily_change is not None and not no_daily_change:
+                            update_properties["日涨跌"] = {"number": daily_change}
 
                         if nav_date and nav_date != last_nav_update_date:
                             update_properties["净值日期"] = {"date": {"start": nav_date}}
@@ -961,20 +999,27 @@ def update_notion():
                                 log_success(f"已更新基金 {fund_code} ({asset_name}) | 净值: {price}")
                             if "最大回撤" in update_properties:
                                 log_success(f"已更新基金 {fund_code} ({asset_name}) 最大回撤: {round(drawdown * 100, 2)}%")
+                            if "日涨跌" in update_properties:
+                                log_success(f"已更新基金 {fund_code} ({asset_name}) 日涨跌: {round(daily_change * 100, 2)}%")
 
                 elif "理财" in asset_type:
                     wealth_info = get_cmb_wealth_price(fund_code)
                     price = wealth_info.get("price")
                     nav_date = wealth_info.get("nav_date")
+                    saa_code = wealth_info.get("saa_code")
+                    daily_change = get_cmb_wealth_daily_change(fund_code, saa_code, price, nav_date) if price and saa_code else None
                     no_price_change = numbers_equal(price, current_nav_value)
+                    no_daily_change = daily_change is None or numbers_equal(daily_change, current_daily_change_value)
                     same_nav_date = nav_date == last_nav_update_date
 
-                    if price and same_nav_date and no_price_change:
+                    if price and same_nav_date and no_price_change and no_daily_change:
                         log_skip(f"理财 {fund_code} ({asset_name}) 净值未变化 | 净值日期: {nav_date or '无'}")
                     elif price:
                         update_properties = {}
                         if not no_price_change:
                             update_properties["当前净值"] = {"number": price}
+                        if daily_change is not None and not no_daily_change:
+                            update_properties["日涨跌"] = {"number": daily_change}
                         if nav_date and nav_date != last_nav_update_date:
                             update_properties["净值日期"] = {"date": {"start": nav_date}}
                         if update_properties:
@@ -982,7 +1027,10 @@ def update_notion():
                                 page_id=page["id"],
                                 properties=update_properties
                             )
-                            log_success(f"已更新理财 {fund_code} ({asset_name}) | 净值: {price} | 净值日期: {nav_date or '未返回'}")
+                            if "日涨跌" in update_properties:
+                                log_success(f"已更新理财 {fund_code} ({asset_name}) | 净值: {price} | 日涨跌: {round(daily_change * 100, 2)}% | 净值日期: {nav_date or '未返回'}")
+                            else:
+                                log_success(f"已更新理财 {fund_code} ({asset_name}) | 净值: {price} | 净值日期: {nav_date or '未返回'}")
                 else:
                     log_info(f"[{asset_name}] 分类为 '{asset_type}'，未包含'基金'或'理财'，跳过净值更新")
         except Exception as e:
