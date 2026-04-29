@@ -32,13 +32,12 @@ CMB_AUTH_KEY = os.environ.get("CMB_AUTH_KEY")
 CMB_VALUE_APP_ID = "LB50.22_CFWebUI"
 CMB_VALUE_AUTH_KEY = os.environ.get("CMB_VALUE_AUTH_KEY")
 
-# 调试配置：可跳过的步骤（用逗号分隔）
-DEBUG_SKIP = set(os.environ.get("DEBUG_SKIP", "").lower().split(",")) if os.environ.get("DEBUG_SKIP") else set()
-DEBUG_FORCE_DCA = os.environ.get("DEBUG_FORCE_DCA", "").lower() == "true"
-
 notion = Client(auth=NOTION_TOKEN)
 DIRECT_REQUEST_SESSION = requests.Session()
 DIRECT_REQUEST_SESSION.trust_env = False
+
+# 缓存 data_source_id，避免重复 API 调用
+_DATA_SOURCE_ID_CACHE = {}
 
 
 def log_section(title):
@@ -75,8 +74,29 @@ def log_debug(message):
 
 
 def get_database_data_source_id(database_id):
-    db_info = notion.databases.retrieve(database_id=database_id)
-    return db_info.get("data_sources", [{}])[0].get("id")
+    """Get data source ID with retry logic and caching for intermittent Notion access issues."""
+    # 先从缓存中查找
+    if database_id in _DATA_SOURCE_ID_CACHE:
+        return _DATA_SOURCE_ID_CACHE[database_id]
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            db_info = notion.databases.retrieve(database_id=database_id)
+            data_source_id = db_info.get("data_sources", [{}])[0].get("id")
+            # 缓存结果
+            _DATA_SOURCE_ID_CACHE[database_id] = data_source_id
+            return data_source_id
+        except Exception as e:
+            error_msg = str(e).lower()
+            is_connection_error = "could not find database" in error_msg or "timeout" in error_msg or "connection" in error_msg
+            
+            if attempt < max_retries - 1 and is_connection_error:
+                wait_time = 2 * (2 ** attempt)  # 2s, 4s
+                log_warn(f"数据库访问失败 (可能是首次连接延迟)，等待 {wait_time}s 后重试 ({attempt + 1}/{max_retries}): {e}")
+                time.sleep(wait_time)
+            else:
+                raise  # 重新抛出异常
 
 
 def query_all_data_source_rows(data_source_id, filter=None):
@@ -557,7 +577,7 @@ def auto_record_investments():
             market_prop = p.get("交易日历", {}).get("select", {})
             market = market_prop.get("name", "A股") if market_prop else "A股"
 
-            if not DEBUG_FORCE_DCA and not is_market_trading_day(today, market, world_holidays):
+            if not is_market_trading_day(today, market, world_holidays):
                 holiday_name = world_holidays.get(market, {}).get(today)
                 if holiday_name:
                     log_skip(f"[{asset_name}] 今日为{market}法定节假日 ({holiday_name})，休市跳过。")
@@ -681,7 +701,8 @@ def process_pending_auto_invest_logs(asset_pages):
                     "交易类型": {"select": {"name": "买入"}},
                     "发生金额": {"number": amount},
                     "成交份额": {"number": confirmed_shares},
-                    "定投": {"checkbox": True}
+                    "定投": {"checkbox": True},
+                    "写入日期": {"date": {"start": today_str}}
                 }
             )
             notion.pages.update(
@@ -698,37 +719,55 @@ def process_pending_auto_invest_logs(asset_pages):
             log_warn(f"定投日志处理失败，已跳过: {e}")
 
 
-def update_average_cost(asset_page_id, asset_name):
+def update_average_cost(asset_page_id, asset_name, asset_page=None):
+    """
+    重算持仓成本。
+    判断是否需要重算的依据：交易表中是否有"写入日期"更新的新交易。
+    这样可以捕捉到"交易日期是4月28日，但4月29日才确认写入"的情况。
+    
+    参数:
+        asset_page_id: 资产页面 ID
+        asset_name: 资产名称
+        asset_page: (可选) 资产页面对象，如果提供则避免重复查询
+    """
     if not TRANSACTION_DB_ID: return
 
     try:
-        latest_transaction_date = get_latest_transaction_date(asset_page_id)
-        if not latest_transaction_date:
-            log_skip(f"[{asset_name}] 无交易记录，跳过成本重算")
-            return
-
-        asset_page = notion.pages.retrieve(page_id=asset_page_id)
+        # 如果没提供资产页面，才去查询（避免重复 API 调用）
+        if asset_page is None:
+            asset_page = notion.pages.retrieve(page_id=asset_page_id)
         last_cost_update_date = get_property_date(asset_page, "持仓成本更新日期")
-        if last_cost_update_date and latest_transaction_date <= last_cost_update_date:
-            log_skip(f"[{asset_name}] 无新交易，跳过成本重算")
-            return
-
+        
         db_info = notion.databases.retrieve(database_id=TRANSACTION_DB_ID)
         ds_id = db_info.get("data_sources", [{}])[0].get("id")
 
-        query_payload = {
-            "data_source_id": ds_id,
-            "filter": {
-                "property": "所属资产", 
-                "relation": {"contains": asset_page_id}
-            }
-        }
-        
         transactions = query_all_data_source_rows(
             ds_id,
-            filter=query_payload["filter"]
+            filter={"property": "所属资产", "relation": {"contains": asset_page_id}}
         )
         
+        if not transactions:
+            log_skip(f"[{asset_name}] 无交易记录，跳过成本重算")
+            return
+
+        # 检查是否有新交易被写入：对比交易表中的"写入日期"
+        has_new_transactions = False
+        if last_cost_update_date:
+            for tx in transactions:
+                write_date = get_property_date(tx, "写入日期")
+                # 只要有一笔交易的写入日期 > 上次更新日期，就需要重算
+                if write_date and write_date > last_cost_update_date:
+                    has_new_transactions = True
+                    break
+        else:
+            # 首次更新，肯定要算
+            has_new_transactions = True
+
+        if not has_new_transactions:
+            log_skip(f"[{asset_name}] 无新交易记录（写入日期无更新），跳过成本重算")
+            return
+
+        # 按交易日期排序，然后重算成本
         def get_date(tx):
             return tx.get("properties", {}).get("交易日期", {}).get("date", {}).get("start", "1970-01-01")
         
@@ -736,12 +775,18 @@ def update_average_cost(asset_page_id, asset_name):
 
         total_shares = 0.0
         avg_cost = 0.0
+        latest_tx_date = None
         
         for tx in transactions:
             p = tx.get("properties", {})
             tx_type = p.get("交易类型", {}).get("select", {}).get("name", "")
             amount = p.get("发生金额", {}).get("number") or 0.0
             shares = p.get("成交份额", {}).get("number") or 0.0
+            tx_date = get_date(tx)
+            
+            # 记录最后一笔交易的日期
+            if tx_date and (latest_tx_date is None or tx_date > latest_tx_date):
+                latest_tx_date = tx_date
             
             if tx_type == "买入":
                 new_shares = total_shares + shares
@@ -754,59 +799,24 @@ def update_average_cost(asset_page_id, asset_name):
                     total_shares = 0.0
                     avg_cost = 0.0
 
+        # 使用实际重算日期作为更新日期，避免 4/29 重算却仍显示 4/28
+        update_date = datetime.date.today().strftime("%Y-%m-%d")
+        
         notion.pages.update(
             page_id=asset_page_id,
             properties={
                 "持仓成本": {"number": round(avg_cost, 4)},
-                "持仓成本更新日期": {"date": {"start": latest_transaction_date}}
+                "持仓成本更新日期": {"date": {"start": update_date}}
             }
         )
-        log_success(f"[{asset_name}] 成本单价重算成功 | 成本: {round(avg_cost, 4)} | 更新日期: {latest_transaction_date}")
+        log_success(f"[{asset_name}] 成本单价重算成功 | 成本: {round(avg_cost, 4)} | 更新日期: {update_date}")
         
     except Exception as e:
         log_error(f"[{asset_name}] 成本计算失败: {str(e)}")
 
-def get_yesterday_profit(today=None):
-    if not HISTORY_DB_ID: return 0.0
-    today = today or datetime.date.today()
-    try:
-        db_info = notion.databases.retrieve(database_id=HISTORY_DB_ID)
-        ds_id = db_info.get("data_sources", [{}])[0].get("id")
-        
-        results = query_all_data_source_rows(ds_id)
-        
-        if not results: return 0.0
-        
-        def get_history_date(page):
-            return page.get("properties", {}).get("日期", {}).get("date", {}).get("start", "1970-01-01")
-        
-        history_before_today = [
-            page for page in results
-            if get_history_date(page) < today.strftime("%Y-%m-%d")
-        ]
-
-        if not history_before_today:
-            return 0.0
-
-        history_before_today.sort(key=get_history_date, reverse=True)
-        props = history_before_today[0].get("properties", {})
-        
-        last_profit = props.get("累计总盈亏", {}).get("number")
-        if last_profit is None:
-            last_val = props.get("总市值", {}).get("number") or 0.0
-            last_cost = props.get("总本金", {}).get("number") or 0.0
-            last_profit = last_val - last_cost
-            
-        return last_profit
-    except Exception as e:
-        log_warn(f"读取昨日快照失败: {e}")
-        return 0.0
-
-
-def get_yesterday_profit_delta(today=None):
-    """返回昨日的当日盈亏（昨日累计盈亏 - 前一日累计盈亏）。"""
+def get_history_profit_context(today=None):
     if not HISTORY_DB_ID:
-        return 0.0
+        return {"latest_profit": 0.0, "previous_profit": 0.0, "profit_base": 0.0}
     today = today or datetime.date.today()
     try:
         db_info = notion.databases.retrieve(database_id=HISTORY_DB_ID)
@@ -814,7 +824,7 @@ def get_yesterday_profit_delta(today=None):
 
         results = query_all_data_source_rows(ds_id)
         if not results:
-            return 0.0
+            return {"latest_profit": 0.0, "previous_profit": 0.0, "profit_base": 0.0}
 
         def get_history_date(page):
             return page.get("properties", {}).get("日期", {}).get("date", {}).get("start", "1970-01-01")
@@ -825,38 +835,44 @@ def get_yesterday_profit_delta(today=None):
         ]
 
         if not history_before_today:
-            return 0.0
+            return {"latest_profit": 0.0, "previous_profit": 0.0, "profit_base": 0.0}
 
         history_before_today.sort(key=get_history_date, reverse=True)
-        yesterday_props = history_before_today[0].get("properties", {})
-        yesterday_profit = yesterday_props.get("累计总盈亏", {}).get("number")
-        if yesterday_profit is None:
-            last_val = yesterday_props.get("总市值", {}).get("number") or 0.0
-            last_cost = yesterday_props.get("总本金", {}).get("number") or 0.0
-            yesterday_profit = last_val - last_cost
 
-        if len(history_before_today) > 1:
-            before_props = history_before_today[1].get("properties", {})
-            before_profit = before_props.get("累计总盈亏", {}).get("number")
-            if before_profit is None:
-                b_val = before_props.get("总市值", {}).get("number") or 0.0
-                b_cost = before_props.get("总本金", {}).get("number") or 0.0
-                before_profit = b_val - b_cost
-        else:
-            before_profit = 0.0
+        def get_profit_from_page(page):
+            props = page.get("properties", {})
+            profit = props.get("累计总盈亏", {}).get("number")
+            if profit is None:
+                last_val = props.get("总市值", {}).get("number") or 0.0
+                last_cost = props.get("总本金", {}).get("number") or 0.0
+                profit = last_val - last_cost
+            return profit or 0.0
 
-        return round((yesterday_profit or 0.0) - (before_profit or 0.0), 2)
+        latest_props = history_before_today[0].get("properties", {})
+        latest_profit = get_profit_from_page(history_before_today[0])
+        previous_profit = get_profit_from_page(history_before_today[1]) if len(history_before_today) > 1 else 0.0
+        latest_cost = latest_props.get("总本金", {}).get("number") or 0.0
+        latest_val = latest_props.get("总市值", {}).get("number") or 0.0
+
+        return {
+            "latest_profit": latest_profit,
+            "previous_profit": previous_profit,
+            "profit_base": latest_cost if latest_cost > 0 else latest_val,
+        }
     except Exception as e:
-        log_warn(f"读取昨日增量快照失败: {e}")
-        return 0.0
+        log_warn(f"读取历史快照失败: {e}")
+        return {"latest_profit": 0.0, "previous_profit": 0.0, "profit_base": 0.0}
 
 
 def update_daily_profit_block(today=None):
     today = today or datetime.date.today()
-    yesterday_delta = get_yesterday_profit_delta(today=today)
+    context = get_history_profit_context(today=today)
+    yesterday_delta = round((context["latest_profit"] or 0.0) - (context["previous_profit"] or 0.0), 2)
+    profit_base = context["profit_base"]
+    daily_rate = yesterday_delta / profit_base * 100 if profit_base > 0 else 0.0
     update_text_block(
         DAILY_PROFIT_BLOCK_ID,
-        f"{format_currency(yesterday_delta, decimals=2, show_sign=True)} 昨日盈亏（{format_percent(yesterday_delta)}）",
+        f"{format_currency(yesterday_delta, decimals=2, show_sign=True)} 昨日盈亏（{format_percent(daily_rate)}）",
         get_profit_color(yesterday_delta),
     )
 
@@ -972,12 +988,12 @@ def update_dashboard_blocks(total_val, total_profit, daily_profit, total_cost, w
         get_profit_color(weighted_annual_return),
     )
 
-def update_notion():
-    data_source_id = get_database_data_source_id(ASSETS_DB_ID)
+def update_asset_net_values(data_source_id=None):
+    data_source_id = data_source_id or get_database_data_source_id(ASSETS_DB_ID)
     log_section("资产净值更新")
-    
+
     assets = query_all_data_source_rows(data_source_id)
-    
+
     for page in assets:
         props = page.get("properties", {})
         asset_name_prop = props.get("资产名称", {}).get("title", [])
@@ -990,102 +1006,109 @@ def update_notion():
         try:
             code_prop = props.get("产品代码", {}).get("rich_text", [])
             asset_type = props.get("资产分类", {}).get("select", {}).get("name", "")
-            
+
             if not code_prop:
                 continue
             fund_code = code_prop[0]["text"]["content"]
-            
-            if "price" not in DEBUG_SKIP:
-                if "基金" in asset_type:
-                    # 只调用一次合并接口！
-                    fund_info = get_fund_info(fund_code)
-                    price = fund_info.get("price")
-                    drawdown = fund_info.get("drawdown")
-                    daily_change = fund_info.get("daily_change")
-                    nav_date = fund_info.get("nav_date")
-                    no_price_change = numbers_equal(price, current_nav_value)
-                    no_drawdown_change = drawdown is None or numbers_equal(drawdown, current_drawdown_value)
-                    no_daily_change = daily_change is None or numbers_equal(daily_change, current_daily_change_value)
-                    same_nav_date = nav_date == last_nav_update_date
 
-                    if same_nav_date and no_price_change and no_drawdown_change and no_daily_change:
-                        log_skip(f"基金 {fund_code} ({asset_name}) 净值/回撤/日涨跌未变化 | 净值日期: {nav_date or '无'}")
-                    else:
-                        update_properties = {}
+            if "基金" in asset_type:
+                fund_info = get_fund_info(fund_code)
+                price = fund_info.get("price")
+                drawdown = fund_info.get("drawdown")
+                daily_change = fund_info.get("daily_change")
+                nav_date = fund_info.get("nav_date")
+                no_price_change = numbers_equal(price, current_nav_value)
+                no_drawdown_change = drawdown is None or numbers_equal(drawdown, current_drawdown_value)
+                no_daily_change = daily_change is None or numbers_equal(daily_change, current_daily_change_value)
+                same_nav_date = nav_date == last_nav_update_date
 
-                        if price is not None and not no_price_change:
-                            update_properties["当前净值"] = {"number": price}
-
-                        if drawdown is not None and not no_drawdown_change:
-                            update_properties["最大回撤"] = {"number": drawdown}
-
-                        if daily_change is not None and not no_daily_change:
-                            update_properties["日涨跌"] = {"number": daily_change}
-
-                        if nav_date and nav_date != last_nav_update_date:
-                            update_properties["净值日期"] = {"date": {"start": nav_date}}
-
-                        if update_properties:
-                            notion.pages.update(page_id=page["id"], properties=update_properties)
-                            if "当前净值" in update_properties:
-                                log_success(f"已更新基金 {fund_code} ({asset_name}) | 净值: {price}")
-                            if "最大回撤" in update_properties:
-                                log_success(f"已更新基金 {fund_code} ({asset_name}) 最大回撤: {round(drawdown * 100, 2)}%")
-                            if "日涨跌" in update_properties:
-                                log_success(f"已更新基金 {fund_code} ({asset_name}) 日涨跌: {round(daily_change * 100, 2)}%")
-
-                elif "理财" in asset_type:
-                    wealth_info = get_cmb_wealth_price(fund_code)
-                    price = wealth_info.get("price")
-                    nav_date = wealth_info.get("nav_date")
-                    saa_code = wealth_info.get("saa_code")
-                    daily_change = get_cmb_wealth_daily_change(fund_code, saa_code, price, nav_date) if price and saa_code else None
-                    no_price_change = numbers_equal(price, current_nav_value)
-                    no_daily_change = daily_change is None or numbers_equal(daily_change, current_daily_change_value)
-                    same_nav_date = nav_date == last_nav_update_date
-
-                    if price and same_nav_date and no_price_change and no_daily_change:
-                        log_skip(f"理财 {fund_code} ({asset_name}) 净值未变化 | 净值日期: {nav_date or '无'}")
-                    elif price:
-                        update_properties = {}
-                        if not no_price_change:
-                            update_properties["当前净值"] = {"number": price}
-                        if daily_change is not None and not no_daily_change:
-                            update_properties["日涨跌"] = {"number": daily_change}
-                        if nav_date and nav_date != last_nav_update_date:
-                            update_properties["净值日期"] = {"date": {"start": nav_date}}
-                        if update_properties:
-                            notion.pages.update(
-                                page_id=page["id"],
-                                properties=update_properties
-                            )
-                            if "日涨跌" in update_properties:
-                                log_success(f"已更新理财 {fund_code} ({asset_name}) | 净值: {price} | 日涨跌: {round(daily_change * 100, 2)}% | 净值日期: {nav_date or '未返回'}")
-                            else:
-                                log_success(f"已更新理财 {fund_code} ({asset_name}) | 净值: {price} | 净值日期: {nav_date or '未返回'}")
+                if same_nav_date and no_price_change and no_drawdown_change and no_daily_change:
+                    log_skip(f"基金 {fund_code} ({asset_name}) 净值/回撤/日涨跌未变化 | 净值日期: {nav_date or '无'}")
                 else:
-                    log_info(f"[{asset_name}] 分类为 '{asset_type}'，未包含'基金'或'理财'，跳过净值更新")
+                    update_properties = {}
+
+                    if price is not None and not no_price_change:
+                        update_properties["当前净值"] = {"number": price}
+
+                    if drawdown is not None and not no_drawdown_change:
+                        update_properties["最大回撤"] = {"number": drawdown}
+
+                    if daily_change is not None and not no_daily_change:
+                        update_properties["日涨跌"] = {"number": daily_change}
+
+                    if nav_date and nav_date != last_nav_update_date:
+                        update_properties["净值日期"] = {"date": {"start": nav_date}}
+
+                    if update_properties:
+                        notion.pages.update(page_id=page["id"], properties=update_properties)
+                        if "当前净值" in update_properties:
+                            log_success(f"已更新基金 {fund_code} ({asset_name}) | 净值: {price}")
+                        if "最大回撤" in update_properties:
+                            log_success(f"已更新基金 {fund_code} ({asset_name}) 最大回撤: {round(drawdown * 100, 2)}%")
+                        if "日涨跌" in update_properties:
+                            log_success(f"已更新基金 {fund_code} ({asset_name}) 日涨跌: {round(daily_change * 100, 2)}%")
+
+            elif "理财" in asset_type:
+                wealth_info = get_cmb_wealth_price(fund_code)
+                price = wealth_info.get("price")
+                nav_date = wealth_info.get("nav_date")
+                saa_code = wealth_info.get("saa_code")
+                daily_change = get_cmb_wealth_daily_change(fund_code, saa_code, price, nav_date) if price and saa_code else None
+                no_price_change = numbers_equal(price, current_nav_value)
+                no_daily_change = daily_change is None or numbers_equal(daily_change, current_daily_change_value)
+                same_nav_date = nav_date == last_nav_update_date
+
+                if price and same_nav_date and no_price_change and no_daily_change:
+                    log_skip(f"理财 {fund_code} ({asset_name}) 净值未变化 | 净值日期: {nav_date or '无'}")
+                elif price:
+                    update_properties = {}
+                    if not no_price_change:
+                        update_properties["当前净值"] = {"number": price}
+                    if daily_change is not None and not no_daily_change:
+                        update_properties["日涨跌"] = {"number": daily_change}
+                    if nav_date and nav_date != last_nav_update_date:
+                        update_properties["净值日期"] = {"date": {"start": nav_date}}
+                    if update_properties:
+                        notion.pages.update(
+                            page_id=page["id"],
+                            properties=update_properties
+                        )
+                        if "日涨跌" in update_properties:
+                            log_success(f"已更新理财 {fund_code} ({asset_name}) | 净值: {price} | 日涨跌: {round(daily_change * 100, 2)}% | 净值日期: {nav_date or '未返回'}")
+                        else:
+                            log_success(f"已更新理财 {fund_code} ({asset_name}) | 净值: {price} | 净值日期: {nav_date or '未返回'}")
+            else:
+                log_info(f"[{asset_name}] 分类为 '{asset_type}'，未包含'基金'或'理财'，跳过净值更新")
         except Exception as e:
             log_warn(f"[{asset_name}] 更新失败，已跳过该资产: {e}")
         time.sleep(0.5)
 
-    refreshed_assets = query_all_data_source_rows(data_source_id)
-    process_pending_auto_invest_logs(refreshed_assets)
+    return query_all_data_source_rows(data_source_id)
 
+
+def recalculate_all_costs(asset_pages=None, data_source_id=None):
+    data_source_id = data_source_id or get_database_data_source_id(ASSETS_DB_ID)
     log_section("持仓成本重算")
-    assets_for_cost = query_all_data_source_rows(data_source_id)
-    for page in assets_for_cost:
+    # 如果没提供资产列表，才去查询（通常由上级调用提供以避免重复查询）
+    if asset_pages is None:
+        asset_pages = query_all_data_source_rows(data_source_id)
+    
+    for page in asset_pages:
         props = page.get("properties", {})
         asset_name_prop = props.get("资产名称", {}).get("title", [])
         asset_name = asset_name_prop[0]["text"]["content"] if asset_name_prop else "未知资产"
-        if "cost" not in DEBUG_SKIP:
-            update_average_cost(page["id"], asset_name)
+        update_average_cost(page["id"], asset_name, asset_page=page)
         time.sleep(0.5)
+    return asset_pages
+
+
+def update_snapshot_and_dashboard(data_source_id=None):
+    data_source_id = data_source_id or get_database_data_source_id(ASSETS_DB_ID)
 
     log_section("组合快照")
     log_wait("等待 Notion 重新计算总市值与盈亏...")
-    time.sleep(5) 
-    
+    time.sleep(5)
+
     updated_assets = query_all_data_source_rows(data_source_id)
     total_val, total_cost, total_profit = 0.0, 0.0, 0.0
     weighted_annual_return = 0.0
@@ -1096,11 +1119,11 @@ def update_notion():
         current_val = p.get("当前市值", {}).get("formula", {}).get("number") or 0
         annual_return = p.get("年化收益率", {}).get("formula", {}).get("number") or 0
         max_drawdown = p.get("最大回撤", {}).get("number") or 0
-        
+
         total_val += current_val
         total_cost += p.get("总买入金额", {}).get("formula", {}).get("number") or 0
         total_profit += p.get("累计总盈亏", {}).get("formula", {}).get("number") or 0
-        
+
         weighted_annual_return += annual_return * current_val
         weighted_max_drawdown += abs(max_drawdown) * current_val
 
@@ -1108,10 +1131,11 @@ def update_notion():
     weighted_max_drawdown_pct = round(-(weighted_max_drawdown / total_val) * 100, 2) if total_val > 0 else 0.0
 
     snapshot_date = time.strftime("%Y-%m-%d")
-    yesterday_cumulative = get_yesterday_profit(today=datetime.datetime.strptime(snapshot_date, "%Y-%m-%d").date())
+    snapshot_today = datetime.datetime.strptime(snapshot_date, "%Y-%m-%d").date()
+    history_context = get_history_profit_context(today=snapshot_today)
+    yesterday_cumulative = history_context["latest_profit"]
     daily_profit = total_profit - yesterday_cumulative
-    # 仪表盘中需要显示的是“昨日盈亏”（即昨天的增量），而不是今日的变动。
-    yesterday_delta = get_yesterday_profit_delta(today=datetime.datetime.strptime(snapshot_date, "%Y-%m-%d").date())
+    yesterday_delta = round((history_context["latest_profit"] or 0.0) - (history_context["previous_profit"] or 0.0), 2)
 
     upsert_history_snapshot(
         snapshot_date=snapshot_date,
@@ -1124,7 +1148,6 @@ def update_notion():
     update_dashboard_blocks(
         total_val,
         total_profit,
-        # 这里把传入的当日值替换为昨日增量，以便仪表盘显示“昨日盈亏”。
         yesterday_delta,
         total_cost,
         weighted_max_drawdown_pct,
@@ -1135,16 +1158,55 @@ def update_notion():
         f"快照完成 | 总市值: {round(total_val, 2)} | 累计总盈亏: {round(total_profit, 2)} | 当日盈亏: {round(daily_profit, 2)} | 加权年化收益率: {round(weighted_annual_return * 100, 2)}% | 加权最大回撤: {round(max_drawdown_amount, 2)} ({weighted_max_drawdown_pct}%)"
     )
 
+
+def process_pending_auto_invest_logs_task():
+    data_source_id = get_database_data_source_id(ASSETS_DB_ID)
+    refreshed_assets = query_all_data_source_rows(data_source_id)
+    process_pending_auto_invest_logs(refreshed_assets)
+    return refreshed_assets
+
+
+def update_notion():
+    data_source_id = get_database_data_source_id(ASSETS_DB_ID)
+    refreshed_assets = update_asset_net_values(data_source_id)
+    process_pending_auto_invest_logs(refreshed_assets)
+    recalculate_all_costs(asset_pages=refreshed_assets, data_source_id=data_source_id)
+    update_snapshot_and_dashboard(data_source_id)
+
+
+TASK_REGISTRY = {
+    "auto_record_investments": auto_record_investments,
+    "update_asset_net_values": update_asset_net_values,
+    "process_pending_auto_invest_logs": process_pending_auto_invest_logs_task,
+    "recalculate_all_costs": recalculate_all_costs,
+    "update_snapshot_and_dashboard": update_snapshot_and_dashboard,
+    "update_daily_profit_block": update_daily_profit_block,
+    "update_notion": update_notion,
+}
+
+
+def run_named_task(task_name):
+    task = TASK_REGISTRY.get(task_name)
+    if not task:
+        log_warn(f"未知 TASK_NAME={task_name}，可选项: {', '.join(TASK_REGISTRY.keys())}")
+        return
+    log_section(f"单任务执行 | {task_name}")
+    task()
+
 if __name__ == "__main__":
     # 运行模式：
-    # morning -> 仅写入定投待确认日志
-    # evening -> 处理待确认定投 + 净值/成本/快照全流程
-    # all     -> morning + evening（本地手动联调）
+    # TASK_NAME -> 单独执行某个任务，便于调试页面直接测试
+    # morning   -> 仅写入定投待确认日志 + 更新昨日盈亏块
+    # evening   -> 处理待确认定投 + 净值/成本/快照全流程
+    # all       -> morning + evening（本地手动联调）
+    task_name = (os.environ.get("TASK_NAME") or "").strip()
     run_mode = (os.environ.get("RUN_MODE") or "all").strip().lower()
 
     log_section(f"任务启动 | 模式: {run_mode}")
 
-    if run_mode == "morning":
+    if task_name:
+        run_named_task(task_name)
+    elif run_mode == "morning":
         auto_record_investments()
         update_daily_profit_block()
     elif run_mode == "evening":
