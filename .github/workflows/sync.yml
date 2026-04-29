@@ -18,7 +18,8 @@ jobs:
   morning_enqueue:
     if: inputs.run_mode == 'morning'
     runs-on: ubuntu-latest
-
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: 检出代码
         uses: actions/checkout@v6
@@ -55,7 +56,8 @@ jobs:
   evening_finalize:
     if: inputs.run_mode == 'evening'
     runs-on: ubuntu-latest
-    
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: 检出代码
         uses: actions/checkout@v6
@@ -93,7 +95,8 @@ jobs:
   manual_full:
     if: inputs.run_mode == 'all'
     runs-on: ubuntu-latest
-
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: 检出代码
         uses: actions/checkout@v6

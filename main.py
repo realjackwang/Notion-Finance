@@ -30,6 +30,7 @@ ANNUAL_RETURN_BLOCK_ID = os.environ.get("NOTION_BLOCK_ANNUAL_RETURN_ID")
 CMB_AUTH_APP_ID = "FinProd"
 CMB_AUTH_KEY = os.environ.get("CMB_AUTH_KEY")
 CMB_VALUE_APP_ID = "LB50.22_CFWebUI"
+CMB_VALUE_AUTH_KEY = os.environ.get("CMB_VALUE_AUTH_KEY")
 
 # 调试配置：可跳过的步骤（用逗号分隔）
 DEBUG_SKIP = set(os.environ.get("DEBUG_SKIP", "").lower().split(",")) if os.environ.get("DEBUG_SKIP") else set()
@@ -273,6 +274,23 @@ def generate_cmb_signature_for_app(app_id, timespan):
         log_error(f"生成签名出错: {e}")
         return None
 
+
+def generate_cmb_value_signature(timespan):
+    """为财富历史值接口生成签名 (cfweb.paas.cmbchina.com)"""
+    try:
+        if not CMB_VALUE_AUTH_KEY:
+            log_warn("未配置 CMB_VALUE_AUTH_KEY，无法生成财富值接口签名。")
+            return None
+        message = f"{CMB_VALUE_APP_ID}|{timespan}"
+        key = CMB_VALUE_AUTH_KEY.encode('utf-8')
+        crypt = CryptSM4()
+        crypt.set_key(key, 0)
+        encrypted = crypt.crypt_ecb(message.encode('utf-8'))
+        return base64.b64encode(encrypted).decode('utf-8')
+    except Exception as e:
+        log_error(f"生成财富值签名出错: {e}")
+        return None
+
 def get_tiantian_fund_snapshot(fund_code):
     """天天基金获取净值和净值日期"""
     url = f"http://fundgz.1234567.com.cn/js/{fund_code}.js"
@@ -305,9 +323,10 @@ def get_fund_info(fund_code):
         response = http_request("GET", url, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json().get("data", {})
-        base_data = data.get("sec_header_base_data", [])
-
-        for item in base_data:
+        
+        # 查询 sec_header_base_data：最新净值、最大回撤
+        sec_base_data = data.get("sec_header_base_data", [])
+        for item in sec_base_data:
             if item.get("data_name") == "最新净值":
                 val = item.get("data_value_number")
                 if val is not None and val != "":
@@ -317,7 +336,11 @@ def get_fund_info(fund_code):
                 val = item.get("data_value_number")
                 if val is not None and val != "":
                     result["drawdown"] = float(val)
-            elif item.get("data_name") == "日涨跌":
+        
+        # 查询 fir_header_base_data：日涨跌
+        fir_base_data = data.get("fir_header_base_data", [])
+        for item in fir_base_data:
+            if item.get("data_name") == "日涨跌":
                 val = item.get("data_value_number")
                 if val is not None and val != "":
                     # Notion 百分比字段会自动按百分比显示，因此这里存小数
@@ -359,6 +382,7 @@ def get_cmb_wealth_daily_change(product_code, saa_code, current_price, nav_date=
         if previous_price not in (None, 0):
             return round((current_price - previous_price) / previous_price, 6)
 
+    log_warn(f"理财前值未命中 | 产品: {product_code} | 回看天数: {lookback_days}")
     return None
 
 
@@ -440,7 +464,7 @@ def get_cmb_wealth_price(product_code):
 def get_cmb_wealth_price_by_date(product_code, saa_code, trade_date):
     url = "https://cfweb.paas.cmbchina.com/api/ProductValue/getSAValueByPageOrDate"
     timespan = str(int(time.time() * 1000))
-    signature = generate_cmb_signature_for_app(CMB_VALUE_APP_ID, timespan)
+    signature = generate_cmb_value_signature(timespan)
     if not signature:
         return {"price": None, "nav_date": None}
 
@@ -469,6 +493,8 @@ def get_cmb_wealth_price_by_date(product_code, saa_code, trade_date):
         rows = ((data.get("body") or {}).get("data")) or []
         if not rows:
             return {"price": None, "nav_date": None}
+
+        row_dates = [row.get("znavDat") for row in rows if row.get("znavDat")]
 
         target_date = trade_date.replace("-", "")
         for row in rows:
@@ -538,8 +564,6 @@ def auto_record_investments():
                 else:
                     log_skip(f"[{asset_name}] 今日为{market}非交易日，跳过。")
                 continue
-            if DEBUG_FORCE_DCA and not is_market_trading_day(today, market, world_holidays):
-                log_debug(f"[{asset_name}] 今日虽为{market}非交易日，但已启用 DEBUG_FORCE_DCA。")
 
             log_key = (page["id"], today_str)
             if log_key in existing_log_keys:
@@ -961,9 +985,7 @@ def update_notion():
                 continue
             fund_code = code_prop[0]["text"]["content"]
             
-            if "price" in DEBUG_SKIP:
-                log_debug(f"跳过 {asset_name} 的净值更新")
-            else:
+            if "price" not in DEBUG_SKIP:
                 if "基金" in asset_type:
                     # 只调用一次合并接口！
                     fund_info = get_fund_info(fund_code)
@@ -1046,9 +1068,7 @@ def update_notion():
         props = page.get("properties", {})
         asset_name_prop = props.get("资产名称", {}).get("title", [])
         asset_name = asset_name_prop[0]["text"]["content"] if asset_name_prop else "未知资产"
-        if "cost" in DEBUG_SKIP:
-            log_debug(f"跳过 {asset_name} 的成本重算")
-        else:
+        if "cost" not in DEBUG_SKIP:
             update_average_cost(page["id"], asset_name)
         time.sleep(0.5)
 
