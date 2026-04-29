@@ -851,6 +851,16 @@ def get_yesterday_profit_delta(today=None):
         return 0.0
 
 
+def update_daily_profit_block(today=None):
+    today = today or datetime.date.today()
+    yesterday_delta = get_yesterday_profit_delta(today=today)
+    update_text_block(
+        DAILY_PROFIT_BLOCK_ID,
+        f"{format_currency(yesterday_delta, decimals=2, show_sign=True)} 昨日盈亏（{format_percent(yesterday_delta)}）",
+        get_profit_color(yesterday_delta),
+    )
+
+
 def upsert_history_snapshot(snapshot_date, total_val, total_cost, total_profit, daily_profit, weighted_annual_return):
     db_info = notion.databases.retrieve(database_id=HISTORY_DB_ID)
     ds_id = db_info.get("data_sources", [{}])[0].get("id")
@@ -1136,10 +1146,12 @@ if __name__ == "__main__":
 
     if run_mode == "morning":
         auto_record_investments()
+        update_daily_profit_block()
     elif run_mode == "evening":
         update_notion()
     elif run_mode == "all":
         auto_record_investments()
+        update_daily_profit_block()
         update_notion()
     else:
         log_warn(f"未知 RUN_MODE={run_mode}，按 all 执行")
