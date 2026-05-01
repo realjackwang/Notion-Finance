@@ -50,6 +50,10 @@ jobs:
           NOTION_BLOCK_ANNUAL_RETURN_ID: ${{ secrets.NOTION_BLOCK_ANNUAL_RETURN_ID }}
 
           CMB_AUTH_KEY: ${{ secrets.CMB_AUTH_KEY }}
+          CMB_VALUE_AUTH_KEY: ${{ secrets.CMB_VALUE_AUTH_KEY }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UIDS: ${{ secrets.WXPUSHER_UIDS }}
+          WXPUSHER_TOPIC_IDS: ${{ secrets.WXPUSHER_TOPIC_IDS }}
           RUN_MODE: morning
         run: python main.py
 
@@ -88,6 +92,10 @@ jobs:
           NOTION_BLOCK_ANNUAL_RETURN_ID: ${{ secrets.NOTION_BLOCK_ANNUAL_RETURN_ID }}
           
           CMB_AUTH_KEY: ${{ secrets.CMB_AUTH_KEY }}
+          CMB_VALUE_AUTH_KEY: ${{ secrets.CMB_VALUE_AUTH_KEY }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UIDS: ${{ secrets.WXPUSHER_UIDS }}
+          WXPUSHER_TOPIC_IDS: ${{ secrets.WXPUSHER_TOPIC_IDS }}
           RUN_MODE: evening
           
         run: python main.py
@@ -127,5 +135,9 @@ jobs:
           NOTION_BLOCK_ANNUAL_RETURN_ID: ${{ secrets.NOTION_BLOCK_ANNUAL_RETURN_ID }}
 
           CMB_AUTH_KEY: ${{ secrets.CMB_AUTH_KEY }}
+          CMB_VALUE_AUTH_KEY: ${{ secrets.CMB_VALUE_AUTH_KEY }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UIDS: ${{ secrets.WXPUSHER_UIDS }}
+          WXPUSHER_TOPIC_IDS: ${{ secrets.WXPUSHER_TOPIC_IDS }}
           RUN_MODE: all
         run: python main.py
