@@ -565,6 +565,157 @@ def get_cmb_wealth_price(product_code):
         return result
 
 
+def get_ccb_wealth_price(product_code):
+    """建信银行理财查询 - 获取当前净值"""
+    url = 'https://www.wealthccb.com/webqueryapp/product/list'
+    
+    headers = {
+        'accept': 'application/json, text/javascript, */*; q=0.01',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'content-type': 'application/json;charset=UTF-8',
+        'origin': 'https://www.wealthccb.com',
+        'referer': 'https://www.wealthccb.com/productList.html',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0',
+        'x-requested-with': 'XMLHttpRequest'
+    }
+    payload = {
+        "page": 1,
+        "pageSize": 10,
+        "pdCodeOrName": product_code
+    }
+    
+    result = {"price": None, "nav_date": None, "page_id": None}
+
+    try:
+        response = http_request("POST", url, headers=headers, json=payload, timeout=10)
+        data = response.json()
+        
+        if data.get("success") and data.get("code") == 200:
+            items = (data.get("data") or {}).get("list") or []
+            if items:
+                first_item = items[0]
+                nav = first_item.get("accFxMrgnNetval")
+                if nav is not None and nav != "":
+                    result["price"] = float(nav)
+                nav_date = first_item.get("drivDt")
+                if nav_date:
+                    result["nav_date"] = nav_date
+                result["page_id"] = first_item.get("id")
+        
+        return result
+    except Exception as e:
+        log_warn(f"获取建信理财 {product_code} 接口调用出错: {e}")
+        return result
+
+
+def get_ccb_wealth_daily_change(product_code, page_id, current_price, nav_date=None, lookback_days=7):
+    """计算建信理财的日涨跌百分比"""
+    if not current_price or not page_id:
+        return None
+    
+    base_date = None
+    if nav_date:
+        try:
+            base_date = datetime.datetime.strptime(nav_date, "%Y-%m-%d").date()
+        except ValueError:
+            base_date = None
+    if base_date is None:
+        base_date = datetime.date.today()
+    
+    # 向前查找前一个交易日的净值
+    for offset in range(1, lookback_days + 1):
+        candidate_date = base_date - datetime.timedelta(days=offset)
+        history_info = get_ccb_wealth_price_by_date(
+            product_code,
+            page_id,
+            candidate_date.strftime("%Y-%m-%d")
+        )
+        previous_price = history_info.get("price")
+        if previous_price not in (None, 0):
+            return round((current_price - previous_price) / previous_price, 6)
+    
+    log_warn(f"建信理财前值未命中 | 产品: {product_code} | 回看天数: {lookback_days}")
+    return None
+
+
+def get_ccb_wealth_price_by_date(product_code, page_id, trade_date):
+    """建信银行理财查询 - 获取指定日期的历史净值"""
+    if not page_id:
+        return {"price": None, "nav_date": None}
+    
+    url = f'https://www.wealthccb.com/product/{page_id}.html'
+    
+    headers = {
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0',
+        'referer': 'https://www.wealthccb.com/productList.html',
+    }
+    
+    try:
+        response = http_request("GET", url, headers=headers, timeout=10)
+        html_content = response.text
+        
+        import re
+        
+        # 检查HTML是否包含必需的数据
+        if 'xData' not in html_content or 'sData' not in html_content:
+            log_warn(f"HTML未包含xData/sData标记 | 产品: {product_code}")
+            return {"price": None, "nav_date": None}
+        
+        # 提取xData数组：兼容多行格式和各种空白符
+        xdata_match = re.search(r'xData\s*=\s*\[([\d,\s]+)\]', html_content, re.DOTALL)
+        
+        # 提取sData数组：会有if-else分支，我们取单位净值那一支(else分支)
+        sdata_match = re.search(
+            r'if\(bool\)\{[^}]*?sData\s*=\s*\[([\d\.,\s]+)\][^}]*?\}else\{[^}]*?sData\s*=\s*\[([\d\.,\s]+)\]',
+            html_content,
+            re.DOTALL
+        )
+        
+        if not sdata_match:
+            # 如果没有if-else结构，尝试简单的sData提取
+            sdata_match = re.search(r'sData\s*=\s*\[([\d\.,\s]+)\]', html_content, re.DOTALL)
+            sdata_group_idx = 1
+        else:
+            sdata_group_idx = 2  # 取else分支中的sData（单位净值）
+        
+        if not xdata_match or not sdata_match:
+            return {"price": None, "nav_date": None}
+        
+        # 解析日期和净值数据
+        xdata_str = xdata_match.group(1)
+        sdata_str = sdata_match.group(sdata_group_idx)
+        
+        # 清理并转换为列表：移除所有空白符和逗号之间的内容
+        dates = [d.strip() for d in re.findall(r'\d+', xdata_str)]
+        prices = [p.strip() for p in re.findall(r'\d+\.\d+', sdata_str)]
+        # 格式化trade_date：支持 2026-05-09 或 20260509 格式
+        trade_date_formatted = trade_date.replace('-', '')
+        if len(trade_date_formatted) != 8:
+            log_warn(f"日期格式错误 | 原始: {trade_date} | 格式化: {trade_date_formatted}")
+            return {"price": None, "nav_date": None}
+        
+        # 查找匹配的日期
+        for idx, date_str in enumerate(dates):
+            if idx < len(prices) and date_str == trade_date_formatted:
+                try:
+                    price = float(prices[idx])
+                    return {
+                        "price": price,
+                        "nav_date": trade_date
+                    }
+                except (ValueError, IndexError):
+                    pass
+        
+        # 未找到该日期
+        return {"price": None, "nav_date": None}
+        
+    except Exception as e:
+        log_warn(f"查询建信理财产品 {product_code} 历史净值出错: {type(e).__name__}: {e}")
+        return {"price": None, "nav_date": None}
+
+
 def get_cmb_wealth_price_by_date(product_code, saa_code, trade_date):
     url = "https://cfweb.paas.cmbchina.com/api/ProductValue/getSAValueByPageOrDate"
     timespan = str(int(time.time() * 1000))
@@ -769,7 +920,7 @@ def process_pending_auto_invest_logs(asset_pages):
             confirm_price = None
             confirm_nav_date = None
 
-            if "理财" in asset_type and product_code:
+            if asset_type == "招行理财" and product_code:
                 wealth_info = get_cmb_wealth_price(product_code)
                 saa_code = wealth_info.get("saa_code")
                 if not saa_code:
@@ -778,6 +929,10 @@ def process_pending_auto_invest_logs(asset_pages):
                 history_info = get_cmb_wealth_price_by_date(product_code, saa_code, trade_date)
                 confirm_price = history_info.get("price")
                 confirm_nav_date = history_info.get("nav_date")
+            elif asset_type == "建信理财" and product_code:
+                wealth_info = get_ccb_wealth_price(product_code)
+                confirm_price = wealth_info.get("price")
+                confirm_nav_date = wealth_info.get("nav_date")
             elif "基金" in asset_type and product_code:
                 history_info = get_fund_price_by_date(product_code, trade_date)
                 confirm_price = history_info.get("price")
@@ -902,6 +1057,13 @@ def update_average_cost(asset_page_id, asset_name, asset_page=None):
                 if total_shares <= 0:
                     total_shares = 0.0
                     avg_cost = 0.0
+            elif tx_type == "分红":
+                # 现金分红：减少总成本，股数保持不变
+                if total_shares > 0:
+                    avg_cost = max(0, (total_shares * avg_cost - amount)) / total_shares
+            elif tx_type == "分红再投":
+                # 分红再投：增加股数，成本保持不变（无新现金投入）
+                total_shares += shares
 
         # 使用实际重算日期作为更新日期，避免 4/29 重算却仍显示 4/28
         update_date = datetime.date.today().strftime("%Y-%m-%d")
@@ -1152,12 +1314,18 @@ def update_asset_net_values(data_source_id=None):
                         if "日涨跌" in update_properties:
                             log_success(f"已更新基金 {fund_code} ({asset_name}) 日涨跌: {round(daily_change * 100, 2)}%")
 
-            elif "理财" in asset_type:
+            elif asset_type == "招行理财":
                 wealth_info = get_cmb_wealth_price(fund_code)
                 price = wealth_info.get("price")
                 nav_date = wealth_info.get("nav_date")
                 saa_code = wealth_info.get("saa_code")
                 daily_change = get_cmb_wealth_daily_change(fund_code, saa_code, price, nav_date) if price and saa_code else None
+            elif asset_type == "建信理财":
+                wealth_info = get_ccb_wealth_price(fund_code)
+                price = wealth_info.get("price")
+                nav_date = wealth_info.get("nav_date")
+                page_id = wealth_info.get("page_id")
+                daily_change = get_ccb_wealth_daily_change(fund_code, page_id, price, nav_date) if price and page_id else None
                 no_price_change = numbers_equal(price, current_nav_value)
                 no_daily_change = daily_change is None or numbers_equal(daily_change, current_daily_change_value)
                 same_nav_date = nav_date == last_nav_update_date
