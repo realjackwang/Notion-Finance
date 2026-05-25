@@ -4,6 +4,7 @@ import json
 import time
 import base64
 import datetime
+import html
 import chinese_calendar as calendar
 import holidays
 from notion_client import Client
@@ -31,6 +32,12 @@ CMB_AUTH_APP_ID = "FinProd"
 CMB_AUTH_KEY = os.environ.get("CMB_AUTH_KEY")
 CMB_VALUE_APP_ID = "LB50.22_CFWebUI"
 CMB_VALUE_AUTH_KEY = os.environ.get("CMB_VALUE_AUTH_KEY")
+
+# WxPusher 推送配置
+WXPUSHER_APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN")
+WXPUSHER_UIDS = [uid.strip() for uid in (os.environ.get("WXPUSHER_UIDS") or "").split(",") if uid.strip()]
+WXPUSHER_TOPIC_IDS_RAW = [topic.strip() for topic in (os.environ.get("WXPUSHER_TOPIC_IDS") or "").split(",") if topic.strip()]
+WXPUSHER_URL = "https://wxpusher.zjiecode.com/api/send/message"
 
 notion = Client(auth=NOTION_TOKEN)
 DIRECT_REQUEST_SESSION = requests.Session()
@@ -71,6 +78,77 @@ def log_error(message):
 
 def log_debug(message):
     print(f"🧪 | {message}")
+
+
+def get_wxpusher_topic_ids():
+    topic_ids = []
+    for topic in WXPUSHER_TOPIC_IDS_RAW:
+        try:
+            topic_ids.append(int(topic))
+        except ValueError:
+            log_warn(f"WXPUSHER_TOPIC_IDS 含非法值，已忽略: {topic}")
+    return topic_ids
+
+
+def send_wxpusher_message(summary, content_html, url=""):
+    if not WXPUSHER_APP_TOKEN:
+        log_info("未配置 WXPUSHER_APP_TOKEN，跳过 WxPusher 推送。")
+        return
+
+    topic_ids = get_wxpusher_topic_ids()
+    if not WXPUSHER_UIDS and not topic_ids:
+        log_warn("未配置 WXPUSHER_UIDS 或 WXPUSHER_TOPIC_IDS，跳过 WxPusher 推送。")
+        return
+
+    payload = {
+        "appToken": WXPUSHER_APP_TOKEN,
+        "content": content_html,
+        "summary": summary,
+        "contentType": 2,
+        "verifyPayType": 0,
+    }
+    if WXPUSHER_UIDS:
+        payload["uids"] = WXPUSHER_UIDS
+    if topic_ids:
+        payload["topicIds"] = topic_ids
+    if url:
+        payload["url"] = url
+
+    try:
+        response = http_request("POST", WXPUSHER_URL, json=payload, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("code") == 1000:
+            log_success(f"WxPusher 推送成功: {summary}")
+        else:
+            log_warn(f"WxPusher 推送失败: {data}")
+    except Exception as e:
+        log_warn(f"WxPusher 推送异常: {e}")
+
+
+def build_pause_summary(paused_markets):
+    if not paused_markets:
+        return "定投提醒：今天基金暂停"
+    if len(paused_markets) == 1:
+        return f"定投提醒：今天{paused_markets[0]}基金暂停"
+    return f"定投提醒：今天{'、'.join(paused_markets)}基金暂停"
+
+
+def build_pause_content_html(title, paused_funds_by_market, today_str):
+    sections = []
+    for market in sorted(paused_funds_by_market.keys()):
+        fund_names = sorted(set(paused_funds_by_market.get(market, [])))
+        if fund_names:
+            items = "".join(f"<li>{html.escape(name)}</li>" for name in fund_names)
+            detail_html = f"<ul>{items}</ul>"
+        else:
+            detail_html = "<p>未匹配到自动定投基金。</p>"
+        sections.append(f"<h4>{html.escape(market)}</h4>{detail_html}")
+
+    if not sections:
+        sections.append("<p>未匹配到自动定投基金。</p>")
+
+    return f"<h3>{html.escape(title)}</h3><p>日期：{today_str}</p><p>暂停基金如下：</p>{''.join(sections)}"
 
 
 def get_database_data_source_id(database_id):
@@ -231,18 +309,24 @@ def normalize_chinese_date(date_text):
         return None
 
 
-def is_market_trading_day(day, market, holiday_calendars):
+def get_market_pause_reason(day, market, holiday_calendars):
+    # 中国法定节假日优先级最高：非工作日直接归类，不再看市场自身休市。
+    if not calendar.is_workday(day):
+        return "中国法定节假日"
+
+    if market != "A股":
+        market_holidays = holiday_calendars.get(market)
+        if market_holidays and day in market_holidays:
+            return f"{market}法定节假日"
+
     if day.weekday() >= 5:
-        return False
+        return "周末休市"
 
-    if market == "A股":
-        return calendar.is_workday(day)
+    return None
 
-    market_holidays = holiday_calendars.get(market)
-    if market_holidays and day in market_holidays:
-        return False
 
-    return True
+def is_market_trading_day(day, market, holiday_calendars):
+    return get_market_pause_reason(day, market, holiday_calendars) is None
 
 
 def http_request(method, url, **kwargs):
@@ -564,6 +648,24 @@ def auto_record_investments():
                 continue
             existing_log_keys.add((relations[0]["id"], get_property_date(row, "交易日期")))
 
+        paused_funds_by_market = {}
+        for page in assets:
+            props = page.get("properties", {})
+            amount = props.get("定投金额", {}).get("number") or 0
+            if amount <= 0:
+                continue
+            market_prop = props.get("交易日历", {}).get("select", {})
+            market = market_prop.get("name", "A股") if market_prop else "A股"
+            name = get_title_text(page, "资产名称") or "未知资产"
+            if calendar.is_workday(today) and not is_market_trading_day(today, market, world_holidays):
+                paused_funds_by_market.setdefault(market, []).append(name)
+
+        if paused_funds_by_market:
+            paused_markets = sorted(paused_funds_by_market.keys())
+            summary = build_pause_summary(paused_markets)
+            content_html = build_pause_content_html(summary, paused_funds_by_market, today_str)
+            send_wxpusher_message(summary, content_html)
+
         for page in assets:
             p = page.get("properties", {})
             asset_name_prop = p.get("资产名称", {}).get("title", [])
@@ -577,12 +679,14 @@ def auto_record_investments():
             market_prop = p.get("交易日历", {}).get("select", {})
             market = market_prop.get("name", "A股") if market_prop else "A股"
 
-            if not is_market_trading_day(today, market, world_holidays):
-                holiday_name = world_holidays.get(market, {}).get(today)
-                if holiday_name:
-                    log_skip(f"[{asset_name}] 今日为{market}法定节假日 ({holiday_name})，休市跳过。")
+            pause_reason = get_market_pause_reason(today, market, world_holidays)
+            if pause_reason:
+                if pause_reason == "中国法定节假日":
+                    log_skip(f"[{asset_name}] 今日为中国法定节假日，{market}定投跳过。")
+                elif pause_reason == "周末":
+                    log_skip(f"[{asset_name}] 今日为周末，{market}定投跳过。")
                 else:
-                    log_skip(f"[{asset_name}] 今日为{market}非交易日，跳过。")
+                    log_skip(f"[{asset_name}] 今日为{pause_reason}，定投跳过。")
                 continue
 
             log_key = (page["id"], today_str)
